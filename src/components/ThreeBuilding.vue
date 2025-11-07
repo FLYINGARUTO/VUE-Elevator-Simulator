@@ -46,7 +46,8 @@ function call(floor, dir) {
 }
 
 function pressInCarButton(e, floor) {
-  if (e.targets.includes(floor)) return // Already going there
+  if (floor === e.currentFloor) return
+  if (e.targets.includes(floor)) return
   e.floorButtons[floor] = true
   insertTarget(e, floor)
 }
@@ -87,13 +88,31 @@ function schedule(floor, dir) {
 }
 
 function insertTarget(e, floor) {
+  // 允许外部呼叫把“当前楼层”也入队（用于立即到站开门）
   if (e.targets.includes(floor)) return
 
+  // 先入队，再根据当前方向重排
   e.targets.push(floor)
+
   if (e.direction === 'up') {
-    e.targets.sort((a, b) => a - b)
+    const up = e.targets.filter(f => f >= e.currentFloor).sort((a, b) => a - b)
+    const down = e.targets.filter(f => f < e.currentFloor).sort((a, b) => b - a)
+    e.targets = [...up, ...down]
   } else if (e.direction === 'down') {
-    e.targets.sort((a, b) => b - a)
+    const down = e.targets.filter(f => f <= e.currentFloor).sort((a, b) => b - a)
+    const up = e.targets.filter(f => f > e.currentFloor).sort((a, b) => a - b)
+    e.targets = [...down, ...up]
+  } else {
+    e.direction = floor > e.currentFloor ? 'up' : (floor < e.currentFloor ? 'down' : 'idle')
+    if (e.direction === 'up') {
+      const up = e.targets.filter(f => f >= e.currentFloor).sort((a, b) => a - b)
+      const down = e.targets.filter(f => f < e.currentFloor).sort((a, b) => b - a)
+      e.targets = [...up, ...down]
+    } else if (e.direction === 'down') {
+      const down = e.targets.filter(f => f <= e.currentFloor).sort((a, b) => b - a)
+      const up = e.targets.filter(f => f > e.currentFloor).sort((a, b) => a - b)
+      e.targets = [...down, ...up]
+    }
   }
 
   if (e.direction === 'idle') {
