@@ -18,6 +18,60 @@ const elevatorCabHalfHeight = 1.5
 const canvasHost = ref(null)
 const elevators = reactive(Array.from({ length: ELEVATOR_COUNT }, (_, i) => createElevator(i)))
 const floorCalls = reactive(Array.from({ length: FLOORS }, () => ({ up: false, down: false })))
+// 乘客状态管理：waiting/in_elevator/arrived
+const passengers = reactive([])
+let passengerIdCounter = 0
+
+function getShaftXByElevatorId(id) {
+  const count = ELEVATOR_COUNT
+  return (id - (count - 1) / 2) * 7.5
+}
+
+function createPassengerMesh(x, y, z = 0) {
+  const group = new THREE.Group()
+  const bodyGeo = new THREE.CylinderGeometry(0.35, 0.35, 1.2, 16)
+  const headGeo = new THREE.SphereGeometry(0.35, 16, 16)
+  const bodyMat = new THREE.MeshStandardMaterial({ color: '#8aa1ff' })
+  const headMat = new THREE.MeshStandardMaterial({ color: '#ffe0b2' })
+  const body = new THREE.Mesh(bodyGeo, bodyMat)
+  const head = new THREE.Mesh(headGeo, headMat)
+  body.position.set(0, 0.6, 0)
+  head.position.set(0, 1.35, 0)
+  group.add(body)
+  group.add(head)
+  group.position.set(x, y, z)
+  group.castShadow = true
+  group.receiveShadow = true
+  group.name = `passenger-${passengerIdCounter}`
+  scene.add(group)
+  return group
+}
+
+function spawnPassengerAtFloor(floor, assignedElevatorId) {
+  const y = floor * floorHeight + 0.5
+  const x = getShaftXByElevatorId(assignedElevatorId) - 2
+  const mesh = createPassengerMesh(x, y, 0)
+  const p = {
+    id: passengerIdCounter++,
+    floor,
+    target: null,
+    state: 'waiting',
+    assignedElevatorId,
+    elevatorId: null,
+    mesh,
+  }
+  passengers.push(p)
+  return p
+}
+
+function clearAllPassengers() {
+  passengers.forEach(p => {
+    if (p.mesh && p.mesh.parent) {
+      p.mesh.parent.remove(p.mesh)
+    }
+  })
+  passengers.splice(0, passengers.length)
+}
 
 // --- Shared Three.js and Logic Variables --- //
 let renderer, scene, camera, controls, labelRenderer
@@ -25,6 +79,15 @@ let tickTimer = null
 let elevatorMeshes = []
 let cabMatIdle, cabMatOpen
 
+// 状态标签引用数组（与 elevatorMeshes 一一对应）
+let elevatorStatusLabels = []
+
+// 方向箭头辅助函数
+function dirArrow(dir) {
+  if (dir === 'up') return '▲'
+  if (dir === 'down') return '▼'
+  return '·'
+}
 // --- Elevator Logic --- //
 function createElevator(id) {
   return {
@@ -42,38 +105,45 @@ function createElevator(id) {
 function call(floor, dir) {
   if (floor < 0 || floor >= FLOORS) return
   floorCalls[floor][dir] = true
-  schedule(floor, dir)
+  const chosen = schedule(floor, dir)
+  if (chosen) {
+    spawnPassengerAtFloor(floor, chosen.id)
+  }
 }
 
 function pressInCarButton(e, floor) {
   if (floor === e.currentFloor) return
   if (e.targets.includes(floor)) return
   e.floorButtons[floor] = true
+  // 关联乘客的目的地（选层）
+  const passenger = passengers.find(p => p.state === 'in_elevator' && p.elevatorId === e.id && p.target == null)
+  if (passenger) {
+    passenger.target = floor
+  }
   insertTarget(e, floor)
 }
 
 function schedule(floor, dir) {
+  // 优先选择“正朝向呼叫楼层”的电梯（顺路捡人），其次是最近的空闲电梯，最后是需要绕行的电梯。
   let bestElevator = null
   let minCost = Infinity
 
   for (const e of elevators) {
-    let cost
     const distanceToCall = Math.abs(e.currentFloor - floor)
+    let cost
 
     if (e.direction === 'idle') {
-      // Cost for an idle elevator is just the distance to the call floor.
+      // 空闲电梯：距离即代价
       cost = distanceToCall
-    } else if (e.direction === dir && (dir === 'up' ? floor >= e.currentFloor : floor <= e.currentFloor)) {
-      // This elevator is moving towards the call floor and in the same direction.
-      // This is the best case (piggybacking). Cost is just the distance.
+    } else if ((e.direction === 'up' && floor >= e.currentFloor) || (e.direction === 'down' && floor <= e.currentFloor)) {
+      // 电梯正朝向呼叫楼层行进（与乘客期望方向无关），顺路捡人
       cost = distanceToCall
     } else {
-      // The elevator is busy with other tasks or moving in the opposite direction.
-      // The cost is the distance to its final target, plus the distance from there to the new call.
-      const lastTarget = e.targets[e.targets.length - 1]
+      // 需要完成当前队列后折返来接：完成当前行程 + 从终点到新呼叫的距离 + 少量折返惩罚
+      const lastTarget = e.targets[e.targets.length - 1] ?? e.currentFloor
       const distToFinishTrip = Math.abs(lastTarget - e.currentFloor)
       const distFromEndToNewCall = Math.abs(floor - lastTarget)
-      cost = distToFinishTrip + distFromEndToNewCall
+      cost = distToFinishTrip + distFromEndToNewCall + 2
     }
 
     if (cost < minCost) {
@@ -84,7 +154,9 @@ function schedule(floor, dir) {
 
   if (bestElevator) {
     insertTarget(bestElevator, floor)
+    return bestElevator
   }
+  return null
 }
 
 function insertTarget(e, floor) {
@@ -161,6 +233,38 @@ function tick() {
       e.floorButtons[target] = false
 
       const elevatorMesh = elevatorMeshes[e.id]
+
+      // 乘客上下车逻辑
+      if (isExternalCallStop) {
+        // 该层等待的乘客上车（隐藏模型）
+        const boarding = passengers.find(p => p.state === 'waiting' && p.floor === target && p.assignedElevatorId === e.id)
+        if (boarding) {
+          boarding.state = 'in_elevator'
+          boarding.elevatorId = e.id
+          if (boarding.mesh) boarding.mesh.visible = false
+        }
+      } else {
+        // 在目的层下车：先在该层显示乘客，停留2秒后再消失
+        const leaving = passengers.filter(p => p.state === 'in_elevator' && p.elevatorId === e.id && p.target === target)
+        leaving.forEach(p => {
+          p.state = 'arrived'
+          p.floor = target
+          const x = getShaftXByElevatorId(e.id) + 2
+          const y = target * floorHeight + 0.5
+          if (p.mesh) {
+            p.mesh.visible = true
+            p.mesh.position.set(x, y, 0)
+          }
+          // 停留2秒后移除模型与数据
+          setTimeout(() => {
+            if (p.mesh && p.mesh.parent) {
+              p.mesh.parent.remove(p.mesh)
+            }
+            const idx = passengers.indexOf(p)
+            if (idx !== -1) passengers.splice(idx, 1)
+          }, 2000)
+        })
+      }
 
       // Only show the panel if someone was waiting outside (an external call)
       if (isExternalCallStop) {
@@ -328,6 +432,19 @@ onMounted(() => {
     return mesh
   })
 
+  // 为每部电梯创建状态标签（CSS2D）
+  elevatorStatusLabels = elevatorMeshes.map((mesh, i) => {
+    const div = document.createElement('div')
+    div.className = 'elevator-status'
+    div.textContent = `${elevators[i].name} ${dirArrow(elevators[i].direction)} ${elevators[i].currentFloor}`
+    const label = new CSS2DObject(div)
+    label.name = `status-${i}`
+    // 初始位置：轿厢上方一点
+    label.position.set(mesh.position.x, mesh.position.y + elevatorCabHalfHeight + 1.2, mesh.position.z)
+    scene.add(label)
+    return label
+  })
+
   // Ground
   const ground = new THREE.Mesh(new THREE.PlaneGeometry(160, 160), new THREE.MeshPhongMaterial({ color: 0xe8ebef, side: THREE.DoubleSide }))
   ground.rotation.x = -Math.PI / 2
@@ -350,14 +467,27 @@ onMounted(() => {
         mesh.position.y += (mesh.targetY - mesh.position.y) * moveSpeed
       }
 
-      // Dynamically update panel position to stay to the right of the car from camera's view
+      // 动态更新“内部面板”位置（已存在）
       const panel = scene.getObjectByName(`panel-${i}`)
       if (panel) {
         const right = new THREE.Vector3()
-        camera.getWorldDirection(right) // Get camera's forward vector
-        right.cross(camera.up).normalize() // Cross with up to get right vector
+        camera.getWorldDirection(right)
+        right.cross(camera.up).normalize()
         const offset = right.multiplyScalar(7) // 7 units to the right
         panel.position.copy(mesh.position).add(offset)
+      }
+
+      // 动态更新“电梯状态标签”文本与位置（位于轿厢正上方）
+      const status = scene.getObjectByName(`status-${i}`)
+      if (status) {
+        const e = elevators[i]
+        // 统一使用黄色箭头（与车内面板一致）
+        status.element.innerHTML = `${e.name} <span class="arrow">${dirArrow(e.direction)}</span> ${e.currentFloor}`
+        status.position.set(
+          mesh.position.x,
+          mesh.position.y + elevatorCabHalfHeight + 1.2,
+          mesh.position.z
+        )
       }
     })
 
@@ -410,6 +540,7 @@ function reset() {
     floorCalls[f].up = false
     floorCalls[f].down = false
   }
+  clearAllPassengers()
   tick() // Sync view immediately after reset
 }
 </script>
@@ -617,5 +748,13 @@ as they are appended to the body/host outside of the Vue component's scoped styl
   background: #f9a825;
   color: black;
   border-color: #fbc02d;
+}
+</style>
+
+<style>
+.elevator-status .arrow {
+  color: #f9a825;     /* 与车内面板按钮激活色一致 */
+  font-weight: 700;
+  text-shadow: 0 0 3px rgba(0,0,0,0.15);
 }
 </style>
